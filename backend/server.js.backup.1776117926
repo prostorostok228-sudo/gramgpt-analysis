@@ -1,0 +1,1875 @@
+import express from 'express';
+import cors from 'cors';
+import jwt from 'jsonwebtoken';
+import bcrypt from 'bcrypt';
+import { createServer } from 'http';
+import { Server as SocketIO } from 'socket.io';
+import cron from 'node-cron';
+import path from 'path';
+import fs from 'fs';
+import { fileURLToPath } from 'url';
+import multer from 'multer';
+import db from './db.js';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const app = express();
+const httpServer = createServer(app);
+const io = new SocketIO(httpServer, { cors: { origin: '*' } });
+
+const JWT_SECRET = process.env.JWT_SECRET || 'creonix-secret-2024';
+const PORT = process.env.PORT || 3001;
+
+app.use(cors());
+app.use(express.json({ limit: '10mb' }));
+// Assets (JS/CSS) — долгий кэш (они content-hashed)
+app.use('/assets', express.static(path.join(__dirname, 'public', 'assets'), { maxAge: '7d' }));
+// index.html — никакого кэша, всегда свежий
+app.use(express.static(path.join(__dirname, 'public'), {
+  setHeaders(res, filePath) {
+    if (filePath.endsWith('index.html')) {
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+    }
+  }
+}));
+
+// Auth middleware
+function auth(req, res, next) {
+  const token = req.headers.authorization?.split(' ')[1];
+  if (!token) return res.status(401).json({ error: 'Unauthorized' });
+  try {
+    req.user = jwt.verify(token, JWT_SECRET);
+    next();
+  } catch {
+    res.status(401).json({ error: 'Invalid token' });
+  }
+}
+
+// ── AUTH ─────────────────────────────────────────────
+app.post('/api/auth/login', async (req, res) => {
+  const { password } = req.body;
+  const setting = db.prepare('SELECT value FROM system_settings WHERE key = ?').get('password_hash');
+
+  if (!setting?.value) {
+    // First-time setup — set password
+    const hash = await bcrypt.hash(password, 10);
+    db.prepare('UPDATE system_settings SET value = ? WHERE key = ?').run(hash, 'password_hash');
+    const token = jwt.sign({ user: 'admin' }, JWT_SECRET, { expiresIn: '30d' });
+    return res.json({ token, firstTime: true });
+  }
+
+  const valid = await bcrypt.compare(password, setting.value);
+  if (!valid) return res.status(401).json({ error: 'Неверный пароль' });
+
+  const token = jwt.sign({ user: 'admin' }, JWT_SECRET, { expiresIn: '30d' });
+  res.json({ token });
+});
+
+app.post('/api/auth/change-password', auth, async (req, res) => {
+  const { newPassword } = req.body;
+  const hash = await bcrypt.hash(newPassword, 10);
+  db.prepare('UPDATE system_settings SET value = ? WHERE key = ?').run(hash, 'password_hash');
+  res.json({ ok: true });
+});
+
+// ── ACCOUNTS ──────────────────────────────────────────
+app.get('/api/accounts', auth, (req, res) => {
+  const accounts = db.prepare('SELECT * FROM accounts ORDER BY created_at DESC').all();
+  res.json(accounts);
+});
+
+app.post('/api/accounts', auth, (req, res) => {
+  const { phone, proxy_host, proxy_port, proxy_user, proxy_pass, proxy_type, notes } = req.body;
+  try {
+    const result = db.prepare(`
+      INSERT INTO accounts (phone, proxy_host, proxy_port, proxy_user, proxy_pass, proxy_type, notes, status)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'inactive')
+    `).run(phone, proxy_host, proxy_port, proxy_user, proxy_pass, proxy_type || 'socks5', notes);
+    const account = db.prepare('SELECT * FROM accounts WHERE id = ?').get(result.lastInsertRowid);
+    res.json(account);
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+// tdata import — must be before :id routes
+const tdataDir = path.join(__dirname, 'tdata_uploads');
+fs.mkdirSync(tdataDir, { recursive: true });
+
+const tdataUpload = multer({
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => {
+      if (!req._uploadDir) {
+        req._uploadDir = path.join(tdataDir, `session_${Date.now()}`);
+        fs.mkdirSync(req._uploadDir, { recursive: true });
+      }
+      // Preserve directory structure from webkitRelativePath
+      const relDir = path.dirname(file.originalname);
+      const destDir = (relDir && relDir !== '.') ? path.join(req._uploadDir, relDir) : req._uploadDir;
+      fs.mkdirSync(destDir, { recursive: true });
+      cb(null, destDir);
+    },
+    filename: (req, file, cb) => cb(null, path.basename(file.originalname)),
+  }),
+  limits: { fileSize: 200 * 1024 * 1024 },
+});
+
+app.post('/api/accounts/import-tdata', auth, tdataUpload.array('tdata', 500), async (req, res) => {
+  if (!req.files?.length) return res.status(400).json({ error: 'Файлы не загружены' });
+
+  const uploadDir = req._uploadDir;
+
+  // Try to find the tdata subfolder or use uploadDir directly
+  let tdataPath = uploadDir;
+  const subDirs = fs.readdirSync(uploadDir, { withFileTypes: true });
+  const tdataSub = subDirs.find(d => d.isDirectory() && d.name.toLowerCase() === 'tdata');
+  if (tdataSub) tdataPath = path.join(uploadDir, tdataSub.name);
+  console.log('[tdata] tdataPath:', tdataPath);
+
+  const { execFile } = await import('child_process');
+  const { promisify } = await import('util');
+  const execFileAsync = promisify(execFile);
+
+  try {
+    const scriptPath = path.join(__dirname, 'tdata_convert.py');
+    const { stdout, stderr } = await execFileAsync('python3', [scriptPath, tdataPath], {
+      timeout: 60000,
+    });
+
+    let parsed;
+    try { parsed = JSON.parse(stdout.trim()); } catch {
+      return res.status(500).json({ error: 'Ошибка парсинга tdata: ' + stdout });
+    }
+
+    // Single error object
+    if (parsed.error) return res.status(400).json({ error: parsed.error });
+
+    // Array of accounts
+    const accounts = [];
+    for (const item of parsed) {
+      if (item.error) continue; // skip failed accounts
+      const result = db.prepare(`
+        INSERT INTO accounts (phone, session_string, status, first_name, last_name, username, user_id)
+        VALUES (?, ?, 'active', ?, ?, ?, ?)
+      `).run(item.phone, item.session_string, item.first_name, item.last_name, item.username, item.user_id);
+      accounts.push(db.prepare('SELECT * FROM accounts WHERE id = ?').get(result.lastInsertRowid));
+    }
+
+    if (!accounts.length) {
+      const errors = parsed.filter(i => i.error).map(i => i.error).join('; ');
+      return res.status(400).json({ error: 'Не удалось добавить аккаунты. ' + errors });
+    }
+
+    // Cleanup uploaded files
+    fs.rmSync(uploadDir, { recursive: true, force: true });
+
+    res.json(accounts);
+  } catch (e) {
+    res.status(500).json({ error: 'Ошибка конвертации tdata: ' + e.message });
+  }
+});
+
+// ── ZIP IMPORT ────────────────────────────────────────
+const zipUpload = multer({
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => {
+      const dir = path.join(tdataDir, `zip_${Date.now()}`);
+      fs.mkdirSync(dir, { recursive: true });
+      req._zipUploadDir = dir;
+      cb(null, dir);
+    },
+    filename: (req, file, cb) => cb(null, file.originalname),
+  }),
+  limits: { fileSize: 500 * 1024 * 1024 },
+});
+
+app.post('/api/accounts/import-zip', auth, zipUpload.single('zipfile'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'ZIP файл не загружен' });
+
+  const uploadDir = req._zipUploadDir;
+  const zipPath = path.join(uploadDir, req.file.originalname);
+
+  try {
+    const AdmZip = (await import('adm-zip')).default;
+    const zip = new AdmZip(zipPath);
+    const extractDir = path.join(uploadDir, 'extracted');
+    fs.mkdirSync(extractDir, { recursive: true });
+    zip.extractAllTo(extractDir, true);
+
+    // Find tdata subdirectories inside extracted content
+    function findTdataDirs(dir) {
+      const results = [];
+      try {
+        const entries = fs.readdirSync(dir, { withFileTypes: true });
+        for (const entry of entries) {
+          if (entry.isDirectory()) {
+            const full = path.join(dir, entry.name);
+            // Check if this looks like a tdata folder (has key or D877F783D5D3EF8C file)
+            const sub = fs.readdirSync(full, { withFileTypes: true });
+            const isTdata = sub.some(f => f.name === 'key_datas' || f.name === 'D877F783D5D3EF8C');
+            if (isTdata) {
+              results.push(full);
+            } else {
+              // Recurse one level deeper
+              results.push(...findTdataDirs(full));
+            }
+          }
+        }
+      } catch {}
+      return results;
+    }
+
+    const tdataDirs = findTdataDirs(extractDir);
+    if (!tdataDirs.length) {
+      // Try treating extractDir itself as tdata
+      tdataDirs.push(extractDir);
+    }
+
+    const { execFile } = await import('child_process');
+    const { promisify } = await import('util');
+    const execFileAsync = promisify(execFile);
+    const scriptPath = path.join(__dirname, 'tdata_convert.py');
+    const { TelegramClient } = await import('telegram');
+    const { StringSession } = await import('telegram/sessions/index.js');
+    const settings = db.prepare('SELECT key, value FROM system_settings').all();
+    const sMap = Object.fromEntries(settings.map(s => [s.key, s.value]));
+
+    const added = [];
+    const failed = [];
+    const skipped = [];
+
+    for (const tdataPath of tdataDirs) {
+      try {
+        const { stdout } = await execFileAsync('python3', [scriptPath, tdataPath], { timeout: 60000 });
+        let parsed;
+        try { parsed = JSON.parse(stdout.trim()); } catch { failed.push({ path: tdataPath, error: 'parse error' }); continue; }
+
+        if (!Array.isArray(parsed)) parsed = [parsed];
+
+        for (const item of parsed) {
+          if (item.error) { failed.push({ error: item.error }); continue; }
+
+          // Check if already exists
+          const existing = db.prepare('SELECT id FROM accounts WHERE phone = ?').get(item.phone);
+          if (existing) { skipped.push({ phone: item.phone, reason: 'already exists' }); continue; }
+
+          // Validate session by connecting
+          let status = 'active';
+          let firstName = item.first_name;
+          let lastName = item.last_name;
+          let username = item.username;
+          let userId = item.user_id;
+
+          try {
+            const client = new TelegramClient(
+              new StringSession(item.session_string),
+              parseInt(sMap.tg_api_id || '2040'),
+              sMap.tg_api_hash || 'b18441a1ff607e10a989891a5462e627',
+              { connectionRetries: 2, timeout: 15 }
+            );
+            await client.connect();
+            const me = await client.getMe();
+            firstName = me.firstName || firstName;
+            lastName = me.lastName || lastName;
+            username = me.username || username;
+            userId = me.id?.toString() || userId;
+
+            // Check spamblock by trying to access a public channel
+            try {
+              await client.getEntity('@telegram');
+            } catch (e) {
+              if (e.message?.includes('SPAM') || e.message?.includes('banned')) {
+                status = 'spamblock';
+              }
+            }
+            await client.disconnect();
+          } catch (e) {
+            if (e.message?.includes('AUTH_KEY_UNREGISTERED') || e.message?.includes('UNAUTHORIZED')) {
+              status = 'unauthorized';
+            } else if (e.message?.includes('USER_DEACTIVATED') || e.message?.includes('banned')) {
+              status = 'banned';
+            } else {
+              status = 'inactive';
+            }
+          }
+
+          const result = db.prepare(`
+            INSERT OR IGNORE INTO accounts (phone, session_string, status, first_name, last_name, username, user_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+          `).run(item.phone, item.session_string, status, firstName, lastName, username, userId);
+
+          if (result.changes > 0) {
+            added.push(db.prepare('SELECT * FROM accounts WHERE id = ?').get(result.lastInsertRowid));
+          }
+        }
+      } catch (e) {
+        failed.push({ path: tdataPath, error: e.message });
+      }
+    }
+
+    // Cleanup
+    fs.rmSync(uploadDir, { recursive: true, force: true });
+
+    res.json({ added, failed, skipped, summary: { added: added.length, failed: failed.length, skipped: skipped.length } });
+  } catch (e) {
+    try { fs.rmSync(uploadDir, { recursive: true, force: true }); } catch {}
+    res.status(500).json({ error: 'Ошибка обработки ZIP: ' + e.message });
+  }
+});
+
+// ── JSON / SESSION IMPORT ─────────────────────────────
+const sessionUpload = multer({
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => {
+      if (!req._sessionUploadDir) {
+        req._sessionUploadDir = path.join(tdataDir, `sess_${Date.now()}`);
+        fs.mkdirSync(req._sessionUploadDir, { recursive: true });
+      }
+      cb(null, req._sessionUploadDir);
+    },
+    filename: (req, file, cb) => cb(null, file.originalname),
+  }),
+  limits: { fileSize: 50 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const ok = file.originalname.endsWith('.session') || file.originalname.endsWith('.json');
+    cb(null, ok);
+  },
+});
+
+app.post('/api/accounts/import-session', auth, sessionUpload.array('files', 200), async (req, res) => {
+  if (!req.files?.length) return res.status(400).json({ error: 'Файлы не загружены' });
+
+  const uploadDir = req._sessionUploadDir;
+  const { execFile } = await import('child_process');
+  const { promisify } = await import('util');
+  const execFileAsync = promisify(execFile);
+  const scriptPath = path.join(__dirname, 'session_convert.py');
+  const { TelegramClient } = await import('telegram');
+  const { StringSession } = await import('telegram/sessions/index.js');
+  const settings = db.prepare('SELECT key, value FROM system_settings').all();
+  const sMap = Object.fromEntries(settings.map(s => [s.key, s.value]));
+
+  const added = [];
+  const failed = [];
+  const skipped = [];
+
+  try {
+    const { stdout } = await execFileAsync('python3', [scriptPath, uploadDir], { timeout: 60000 });
+    let parsed;
+    try { parsed = JSON.parse(stdout.trim()); } catch {
+      return res.status(500).json({ error: 'Ошибка парсинга: ' + stdout });
+    }
+    if (!Array.isArray(parsed)) parsed = [parsed];
+
+    for (const item of parsed) {
+      if (item.error) { failed.push({ error: item.error }); continue; }
+
+      if (!item.session_string) { failed.push({ error: 'Нет session_string' }); continue; }
+
+      // Check duplicate by session_string or phone
+      if (item.phone) {
+        const existing = db.prepare('SELECT id FROM accounts WHERE phone = ?').get(item.phone);
+        if (existing) { skipped.push({ phone: item.phone }); continue; }
+      }
+
+      let status = 'inactive';
+      let firstName = item.first_name || '';
+      let lastName = item.last_name || '';
+      let username = item.username || '';
+      let userId = item.user_id || '';
+      let phone = item.phone || '';
+
+      // Try to validate & fetch profile
+      try {
+        const client = new TelegramClient(
+          new StringSession(item.session_string),
+          parseInt(sMap.tg_api_id || '2040'),
+          sMap.tg_api_hash || 'b18441a1ff607e10a989891a5462e627',
+          { connectionRetries: 2, timeout: 15 }
+        );
+        await client.connect();
+        const me = await client.getMe();
+        firstName = me.firstName || firstName;
+        lastName = me.lastName || lastName;
+        username = me.username || username;
+        userId = me.id?.toString() || userId;
+        phone = me.phone ? '+' + me.phone : phone;
+        status = 'active';
+        try {
+          await client.getEntity('@telegram');
+        } catch (e) {
+          if (e.message?.includes('SPAM') || e.message?.includes('banned')) status = 'spamblock';
+        }
+        await client.disconnect();
+      } catch (e) {
+        if (e.message?.includes('AUTH_KEY_UNREGISTERED') || e.message?.includes('UNAUTHORIZED')) {
+          status = 'unauthorized';
+        } else if (e.message?.includes('USER_DEACTIVATED') || e.message?.includes('banned')) {
+          status = 'banned';
+        } else {
+          status = 'inactive';
+        }
+      }
+
+      if (!phone) { failed.push({ error: 'Не удалось определить телефон из сессии' }); continue; }
+
+      const result = db.prepare(`
+        INSERT OR IGNORE INTO accounts (phone, session_string, status, first_name, last_name, username, user_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run(phone, item.session_string, status, firstName, lastName, username, userId);
+
+      if (result.changes > 0) {
+        added.push(db.prepare('SELECT * FROM accounts WHERE id = ?').get(result.lastInsertRowid));
+      } else {
+        skipped.push({ phone });
+      }
+    }
+  } catch (e) {
+    try { fs.rmSync(uploadDir, { recursive: true, force: true }); } catch {}
+    return res.status(500).json({ error: 'Ошибка обработки: ' + e.message });
+  }
+
+  try { fs.rmSync(uploadDir, { recursive: true, force: true }); } catch {}
+  res.json({ added, failed, skipped, summary: { added: added.length, failed: failed.length, skipped: skipped.length } });
+});
+
+app.put('/api/accounts/:id', auth, (req, res) => {
+  const { proxy_host, proxy_port, proxy_user, proxy_pass, proxy_type, notes } = req.body;
+  db.prepare(`
+    UPDATE accounts SET proxy_host=?, proxy_port=?, proxy_user=?, proxy_pass=?, proxy_type=?, notes=?
+    WHERE id=?
+  `).run(proxy_host || null, proxy_port || null, proxy_user || null, proxy_pass || null,
+    proxy_type || 'socks5', notes || null, req.params.id);
+  const account = db.prepare('SELECT * FROM accounts WHERE id = ?').get(req.params.id);
+  res.json(account);
+});
+
+app.post('/api/accounts/:id/test-proxy', auth, async (req, res) => {
+  const account = db.prepare('SELECT * FROM accounts WHERE id = ?').get(req.params.id);
+  if (!account) return res.status(404).json({ error: 'Аккаунт не найден' });
+  if (!account.proxy_host) return res.status(400).json({ ok: false, error: 'Прокси не настроен' });
+  try {
+    const { TelegramClient } = await import('telegram');
+    const { StringSession } = await import('telegram/sessions/index.js');
+    const settings = db.prepare('SELECT key, value FROM system_settings').all();
+    const sMap = Object.fromEntries(settings.map(s => [s.key, s.value]));
+    const client = new TelegramClient(
+      new StringSession(''),
+      parseInt(sMap.tg_api_id || '2040'),
+      sMap.tg_api_hash || 'b18441a1ff607e10a989891a5462e627',
+      { connectionRetries: 1, timeout: 10, proxy: buildProxy(account) }
+    );
+    await client.connect();
+    await client.disconnect();
+    res.json({ ok: true });
+  } catch (e) {
+    res.json({ ok: false, error: e.message });
+  }
+});
+
+app.delete('/api/accounts/:id', auth, (req, res) => {
+  db.prepare('DELETE FROM accounts WHERE id = ?').run(req.params.id);
+  res.json({ ok: true });
+});
+
+// TG Auth flow
+const pendingAuth = new Map();
+
+app.post('/api/accounts/:id/send-code', auth, async (req, res) => {
+  try {
+    const account = db.prepare('SELECT * FROM accounts WHERE id = ?').get(req.params.id);
+    if (!account) return res.status(404).json({ error: 'Account not found' });
+
+    const { TelegramClient } = await import('telegram');
+    const { StringSession } = await import('telegram/sessions/index.js');
+
+    const settings = db.prepare('SELECT key, value FROM system_settings').all();
+    const sMap = Object.fromEntries(settings.map(s => [s.key, s.value]));
+
+    const apiId = parseInt(sMap.tg_api_id || '2040');
+    const apiHash = sMap.tg_api_hash || 'b18441a1ff607e10a989891a5462e627';
+
+    const client = new TelegramClient(new StringSession(''), apiId, apiHash, {
+      connectionRetries: 3,
+      proxy: buildProxy(account),
+    });
+
+    await client.connect();
+
+    let phoneCodeHash;
+    try {
+      const result = await client.sendCode({ apiId, apiHash }, account.phone);
+      phoneCodeHash = result.phoneCodeHash;
+    } catch (e) {
+      return res.status(400).json({ error: e.message });
+    }
+
+    pendingAuth.set(account.id, { client, phoneCodeHash, phone: account.phone });
+    res.json({ ok: true, phoneCodeHash });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/accounts/:id/verify-code', auth, async (req, res) => {
+  const { code, password } = req.body;
+  const pending = pendingAuth.get(parseInt(req.params.id));
+  if (!pending) return res.status(400).json({ error: 'No pending auth' });
+
+  try {
+    const { TelegramClient } = await import('telegram');
+    const { client, phoneCodeHash, phone } = pending;
+
+    try {
+      await client.invoke(new (await import('telegram/tl/functions/auth/index.js')).SignIn({
+        phoneNumber: phone,
+        phoneCodeHash,
+        phoneCode: code,
+      }));
+    } catch (e) {
+      if (e.message?.includes('SESSION_PASSWORD_NEEDED')) {
+        if (!password) return res.json({ needPassword: true });
+        const { checkPassword } = await import('telegram/utils.js');
+        const passwordSrpResult = await client.invoke(
+          new (await import('telegram/tl/functions/account/index.js')).GetPassword()
+        );
+        await client.invoke(await checkPassword(passwordSrpResult, password));
+      } else throw e;
+    }
+
+    const me = await client.getMe();
+    const sessionString = client.session.save();
+
+    db.prepare(`
+      UPDATE accounts SET session_string=?, status='active', first_name=?, last_name=?, username=?, user_id=?
+      WHERE id=?
+    `).run(sessionString, me.firstName, me.lastName, me.username, me.id?.toString(), req.params.id);
+
+    pendingAuth.delete(parseInt(req.params.id));
+    await client.disconnect();
+
+    const account = db.prepare('SELECT * FROM accounts WHERE id = ?').get(req.params.id);
+    res.json(account);
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+app.post('/api/accounts/:id/check', auth, async (req, res) => {
+  const account = db.prepare('SELECT * FROM accounts WHERE id = ?').get(req.params.id);
+  if (!account?.session_string) return res.json({ status: 'inactive' });
+
+  try {
+    const { TelegramClient } = await import('telegram');
+    const { StringSession } = await import('telegram/sessions/index.js');
+    const settings = db.prepare('SELECT key, value FROM system_settings').all();
+    const sMap = Object.fromEntries(settings.map(s => [s.key, s.value]));
+
+    const client = new TelegramClient(
+      new StringSession(account.session_string),
+      parseInt(sMap.tg_api_id || '2040'),
+      sMap.tg_api_hash || 'b18441a1ff607e10a989891a5462e627',
+      { connectionRetries: 2, proxy: buildProxy(account) }
+    );
+    await client.connect();
+    const me = await client.getMe();
+    await client.disconnect();
+
+    db.prepare(`UPDATE accounts SET status='active', first_name=?, last_name=?, username=? WHERE id=?`)
+      .run(me.firstName, me.lastName, me.username, req.params.id);
+
+    res.json({ status: 'active', user: me });
+  } catch (e) {
+    const status = e.message?.includes('AUTH_KEY_UNREGISTERED') ? 'unauthorized'
+      : e.message?.includes('USER_DEACTIVATED') ? 'banned' : 'error';
+    db.prepare('UPDATE accounts SET status=? WHERE id=?').run(status, req.params.id);
+    res.json({ status, error: e.message });
+  }
+});
+
+
+// ── QR LOGIN ──────────────────────────────────────────
+const pendingQr = new Map();
+
+app.post('/api/accounts/qr-start', auth, async (req, res) => {
+  try {
+    const { TelegramClient } = await import('telegram');
+    const { StringSession } = await import('telegram/sessions/index.js');
+    const { Api } = await import('telegram');
+
+    const settings = db.prepare('SELECT key, value FROM system_settings').all();
+    const sMap = Object.fromEntries(settings.map(s => [s.key, s.value]));
+
+    const apiId = parseInt(sMap.tg_api_id || '2040');
+    const apiHash = sMap.tg_api_hash || 'b18441a1ff607e10a989891a5462e627';
+
+    const client = new TelegramClient(new StringSession(''), apiId, apiHash, {
+      connectionRetries: 3,
+    });
+    await client.connect();
+
+    const tokenResult = await client.invoke(new Api.auth.ExportLoginToken({
+      apiId, apiHash, exceptIds: [],
+    }));
+
+    if (!tokenResult.token) throw new Error('Не удалось получить QR токен');
+
+    const token = Buffer.from(tokenResult.token).toString('base64url');
+    const tempId = Date.now().toString(36) + Math.random().toString(36).slice(2);
+
+    pendingQr.set(tempId, { client, apiId, apiHash, expires: Date.now() + 120000 });
+
+    // Auto-cleanup after 2 min
+    setTimeout(() => {
+      const entry = pendingQr.get(tempId);
+      if (entry) { try { entry.client.disconnect(); } catch (_) {} pendingQr.delete(tempId); }
+    }, 120000);
+
+    res.json({ tempId, qrUrl: `tg://login?token=${token}`, expiresIn: 30 });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/accounts/qr-status/:tempId', auth, async (req, res) => {
+  const entry = pendingQr.get(req.params.tempId);
+  if (!entry) return res.json({ status: 'expired' });
+  if (Date.now() > entry.expires) {
+    try { entry.client.disconnect(); } catch (_) {}
+    pendingQr.delete(req.params.tempId);
+    return res.json({ status: 'expired' });
+  }
+
+  try {
+    const { Api } = await import('telegram');
+    const { client, apiId, apiHash } = entry;
+
+    const result = await client.invoke(new Api.auth.ExportLoginToken({
+      apiId, apiHash, exceptIds: [],
+    }));
+
+    // LoginTokenSuccess — user scanned and authorized
+    if (result.className === 'auth.LoginTokenSuccess' || result.authorization) {
+      const me = await client.getMe();
+      const sessionString = client.session.save();
+
+      const existing = db.prepare('SELECT id FROM accounts WHERE user_id=?').get(me.id?.toString());
+      let accountId;
+      if (existing) {
+        db.prepare(`UPDATE accounts SET session_string=?, status='active', first_name=?, last_name=?, username=?, phone=? WHERE id=?`)
+          .run(sessionString, me.firstName, me.lastName, me.username, me.phone || '', existing.id);
+        accountId = existing.id;
+      } else {
+        const ins = db.prepare(`INSERT INTO accounts (phone, session_string, status, first_name, last_name, username, user_id) VALUES (?,?,'active',?,?,?,?)`)
+          .run(me.phone || '', sessionString, me.firstName, me.lastName, me.username, me.id?.toString());
+        accountId = ins.lastInsertRowid;
+      }
+
+      await client.disconnect();
+      pendingQr.delete(req.params.tempId);
+
+      const account = db.prepare('SELECT * FROM accounts WHERE id=?').get(accountId);
+      return res.json({ status: 'authorized', account });
+    }
+
+    // LoginTokenMigrate — need DC migration
+    if (result.className === 'auth.LoginTokenMigrate') {
+      await client._switchDC(result.dcId);
+      const migrated = await client.invoke(new Api.auth.ImportLoginToken({ token: result.token }));
+      if (migrated.authorization) {
+        const me = await client.getMe();
+        const sessionString = client.session.save();
+        const ins = db.prepare(`INSERT OR REPLACE INTO accounts (phone, session_string, status, first_name, last_name, username, user_id) VALUES (?,?,'active',?,?,?,?)`)
+          .run(me.phone || '', sessionString, me.firstName, me.lastName, me.username, me.id?.toString());
+        await client.disconnect();
+        pendingQr.delete(req.params.tempId);
+        const account = db.prepare('SELECT * FROM accounts WHERE id=?').get(ins.lastInsertRowid);
+        return res.json({ status: 'authorized', account });
+      }
+    }
+
+    // Still pending — return fresh QR token
+    const freshToken = Buffer.from(result.token).toString('base64url');
+    res.json({ status: 'pending', qrUrl: `tg://login?token=${freshToken}` });
+  } catch (e) {
+    res.json({ status: 'error', error: e.message });
+  }
+});
+
+// ── PARSING ───────────────────────────────────────────
+app.get('/api/parsing', auth, (req, res) => {
+  const tasks = db.prepare('SELECT * FROM parsing_tasks ORDER BY created_at DESC').all();
+  res.json(tasks);
+});
+
+app.post('/api/parsing', auth, (req, res) => {
+  const { name, type, sources, filters, account_id } = req.body;
+  const result = db.prepare(`
+    INSERT INTO parsing_tasks (name, type, sources, filters, account_id, status)
+    VALUES (?, ?, ?, ?, ?, 'pending')
+  `).run(name, type, JSON.stringify(sources), JSON.stringify(filters || {}), account_id);
+  res.json({ id: result.lastInsertRowid });
+});
+
+app.post('/api/parsing/:id/start', auth, async (req, res) => {
+  const task = db.prepare('SELECT * FROM parsing_tasks WHERE id = ?').get(req.params.id);
+  if (!task) return res.status(404).json({ error: 'Not found' });
+
+  db.prepare(`UPDATE parsing_tasks SET status=?, started_at=datetime('now') WHERE id=?`).run('running', task.id);
+  res.json({ ok: true });
+
+  // Run async
+  runParsingTask(task, io).catch(e => {
+    db.prepare('UPDATE parsing_tasks SET status=?, error_text=? WHERE id=?').run('failed', e.message, task.id);
+    io.emit('parsing:update', { id: task.id, status: 'failed', error: e.message });
+  });
+});
+
+app.get('/api/parsing/:id/results', auth, (req, res) => {
+  const users = db.prepare('SELECT * FROM parsed_users WHERE task_id = ? LIMIT 1000').all(req.params.id);
+  res.json(users);
+});
+
+app.delete('/api/parsing/:id', auth, (req, res) => {
+  db.prepare('DELETE FROM parsed_users WHERE task_id = ?').run(req.params.id);
+  db.prepare('DELETE FROM parsing_tasks WHERE id = ?').run(req.params.id);
+  res.json({ ok: true });
+});
+
+// ── CHANNEL SEARCH ────────────────────────────────────
+app.get('/api/parsing/channels', auth, (req, res) => {
+  const searches = db.prepare('SELECT * FROM channel_searches ORDER BY created_at DESC').all();
+  res.json(searches);
+});
+
+app.post('/api/parsing/channels', auth, (req, res) => {
+  const { name, keyword, min_members, result_limit, account_id } = req.body;
+  const result = db.prepare(`
+    INSERT INTO channel_searches (name, keyword, min_members, result_limit, account_id, status)
+    VALUES (?, ?, ?, ?, ?, 'pending')
+  `).run(name || keyword, keyword, min_members || 0, result_limit || 100, account_id);
+  res.json({ id: result.lastInsertRowid });
+});
+
+app.post('/api/parsing/channels/:id/start', auth, async (req, res) => {
+  const task = db.prepare('SELECT * FROM channel_searches WHERE id = ?').get(req.params.id);
+  if (!task) return res.status(404).json({ error: 'Not found' });
+
+  db.prepare(`UPDATE channel_searches SET status=?, started_at=datetime('now') WHERE id=?`).run('running', task.id);
+  res.json({ ok: true });
+
+  runChannelSearchTask(task, io).catch(e => {
+    db.prepare('UPDATE channel_searches SET status=?, error_text=? WHERE id=?').run('failed', e.message, task.id);
+    io.emit('channels:update', { id: task.id, status: 'failed', error: e.message });
+  });
+});
+
+app.get('/api/parsing/channels/:id/results', auth, (req, res) => {
+  const channels = db.prepare('SELECT * FROM parsed_channels WHERE search_id = ?').all(req.params.id);
+  if (req.query.format === 'csv') {
+    const csv = ['id,title,username,description,members_count']
+      .concat(channels.map(c => `${c.channel_id},"${(c.title||'').replace(/"/g,'""')}",${c.username||''},"${(c.description||'').replace(/"/g,'""').replace(/\n/g,' ')}",${c.members_count}`))
+      .join('\n');
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename=channels_${req.params.id}.csv`);
+    return res.send(csv);
+  }
+  res.json(channels);
+});
+
+app.delete('/api/parsing/channels/:id', auth, (req, res) => {
+  db.prepare('DELETE FROM parsed_channels WHERE search_id = ?').run(req.params.id);
+  db.prepare('DELETE FROM channel_searches WHERE id = ?').run(req.params.id);
+  res.json({ ok: true });
+});
+
+// ── NEURO COMMENTING ──────────────────────────────────
+app.get('/api/neuro-comment', auth, (req, res) => {
+  const campaigns = db.prepare('SELECT * FROM neuro_comment_campaigns ORDER BY created_at DESC').all();
+  res.json(campaigns);
+});
+
+app.post('/api/neuro-comment', auth, (req, res) => {
+  const c = req.body;
+  const result = db.prepare(`
+    INSERT INTO neuro_comment_campaigns
+    (name, target_channels, accounts_pool, prompt_context, tone, style, use_emoji, emoji_count,
+     banned_words, min_post_length, max_post_age_hours, max_per_day, max_per_account_per_day,
+     delay_min_minutes, delay_max_minutes, active_hours_start, active_hours_end, active_days, ai_model)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+  `).run(
+    c.name, JSON.stringify(c.target_channels), JSON.stringify(c.accounts_pool),
+    c.prompt_context, c.tone || 'friendly', c.style || 'medium',
+    c.use_emoji ? 1 : 0, c.emoji_count || '1-2', c.banned_words || '',
+    c.min_post_length || 50, c.max_post_age_hours || 24, c.max_per_day || 50,
+    c.max_per_account_per_day || 15, c.delay_min_minutes || 5, c.delay_max_minutes || 30,
+    c.active_hours_start || '09:00', c.active_hours_end || '23:00',
+    JSON.stringify(c.active_days || [1,2,3,4,5,6,7]),
+    c.ai_model || 'claude-haiku-4-5-20251001'
+  );
+  // Update new fields separately (migration-safe)
+  if (result.lastInsertRowid) {
+    db.prepare(`UPDATE neuro_comment_campaigns SET join_delay_min=?, join_delay_max=?, comment_probability=? WHERE id=?`)
+      .run(c.join_delay_min ?? 2, c.join_delay_max ?? 4, c.comment_probability ?? 1.0, result.lastInsertRowid);
+  }
+  res.json({ id: result.lastInsertRowid });
+});
+
+app.put('/api/neuro-comment/:id', auth, (req, res) => {
+  const c = req.body;
+  db.prepare(`
+    UPDATE neuro_comment_campaigns SET
+      name=?, target_channels=?, accounts_pool=?, prompt_context=?, tone=?, style=?,
+      use_emoji=?, emoji_count=?, banned_words=?, min_post_length=?, max_post_age_hours=?,
+      max_per_day=?, max_per_account_per_day=?, delay_min_minutes=?, delay_max_minutes=?,
+      active_hours_start=?, active_hours_end=?, ai_model=?
+    WHERE id=?
+  `).run(
+    c.name, JSON.stringify(c.target_channels), JSON.stringify(c.accounts_pool),
+    c.prompt_context, c.tone || 'friendly', c.style || 'medium',
+    c.use_emoji ? 1 : 0, c.emoji_count || '1-2', c.banned_words || '',
+    c.min_post_length || 50, c.max_post_age_hours || 24, c.max_per_day || 50,
+    c.max_per_account_per_day || 15, c.delay_min_minutes || 5, c.delay_max_minutes || 30,
+    c.active_hours_start || '00:00', c.active_hours_end || '23:00',
+    c.ai_model || 'claude-haiku-4-5-20251001',
+    req.params.id
+  );
+  db.prepare(`UPDATE neuro_comment_campaigns SET join_delay_min=?, join_delay_max=?, comment_probability=? WHERE id=?`)
+    .run(c.join_delay_min ?? 2, c.join_delay_max ?? 4, c.comment_probability ?? 1.0, req.params.id);
+  res.json({ ok: true });
+});
+
+app.put('/api/neuro-comment/:id/toggle', auth, (req, res) => {
+  const campaign = db.prepare('SELECT * FROM neuro_comment_campaigns WHERE id=?').get(req.params.id);
+  const newStatus = campaign.status === 'running' ? 'paused' : 'running';
+  // При новом запуске — сбросить старые логи и счётчик комментариев за сегодня
+  if (newStatus === 'running') {
+    db.prepare('DELETE FROM neuro_comment_logs WHERE campaign_id=?').run(req.params.id);
+    db.prepare('UPDATE neuro_comment_campaigns SET comments_today=0 WHERE id=?').run(req.params.id);
+  }
+  db.prepare('UPDATE neuro_comment_campaigns SET status=? WHERE id=?').run(newStatus, req.params.id);
+  res.json({ status: newStatus });
+});
+
+app.delete('/api/neuro-comment/:id', auth, (req, res) => {
+  db.prepare('DELETE FROM neuro_comment_logs WHERE campaign_id=?').run(req.params.id);
+  db.prepare('DELETE FROM neuro_comment_campaigns WHERE id=?').run(req.params.id);
+  res.json({ ok: true });
+});
+
+app.get('/api/neuro-comment/:id/logs', auth, (req, res) => {
+  const logs = db.prepare(`
+    SELECT l.*, a.first_name, a.username FROM neuro_comment_logs l
+    LEFT JOIN accounts a ON a.id = l.account_id
+    WHERE l.campaign_id = ? ORDER BY l.created_at DESC LIMIT 100
+  `).all(req.params.id);
+  res.json(logs);
+});
+
+// ── NEURO CHATTING (DM) ───────────────────────────────
+app.get('/api/neuro-chat', auth, (req, res) => {
+  const campaigns = db.prepare('SELECT * FROM neuro_chat_campaigns ORDER BY created_at DESC').all();
+  res.json(campaigns);
+});
+
+app.post('/api/neuro-chat', auth, (req, res) => {
+  const c = req.body;
+  const result = db.prepare(`
+    INSERT INTO neuro_chat_campaigns
+    (name, parsing_task_id, accounts_pool, message_template, channel_link, ai_reply_enabled,
+     ai_reply_prompt, insert_link_mode, max_dialog_messages, max_per_day, max_per_account_per_day,
+     delay_min_seconds, delay_max_seconds)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+  `).run(
+    c.name, c.parsing_task_id, JSON.stringify(c.accounts_pool), c.message_template,
+    c.channel_link, c.ai_reply_enabled ? 1 : 0, c.ai_reply_prompt,
+    c.insert_link_mode || 'after_no_reply', c.max_dialog_messages || 5,
+    c.max_per_day || 50, c.max_per_account_per_day || 20,
+    c.delay_min_seconds || 30, c.delay_max_seconds || 120
+  );
+  res.json({ id: result.lastInsertRowid });
+});
+
+app.put('/api/neuro-chat/:id/toggle', auth, (req, res) => {
+  const campaign = db.prepare('SELECT * FROM neuro_chat_campaigns WHERE id=?').get(req.params.id);
+  const newStatus = campaign.status === 'running' ? 'paused' : 'running';
+  db.prepare('UPDATE neuro_chat_campaigns SET status=? WHERE id=?').run(newStatus, req.params.id);
+  res.json({ status: newStatus });
+});
+
+app.delete('/api/neuro-chat/:id', auth, (req, res) => {
+  db.prepare('DELETE FROM neuro_chat_messages WHERE campaign_id=?').run(req.params.id);
+  db.prepare('DELETE FROM neuro_chat_contacts WHERE campaign_id=?').run(req.params.id);
+  db.prepare('DELETE FROM neuro_chat_campaigns WHERE id=?').run(req.params.id);
+  res.json({ ok: true });
+});
+
+// ── WARMUP ────────────────────────────────────────────
+app.get('/api/warmup', auth, (req, res) => {
+  const tasks = db.prepare(`
+    SELECT w.*, a.first_name, a.username, a.phone FROM warmup_tasks w
+    LEFT JOIN accounts a ON a.id = w.account_id
+    ORDER BY w.created_at DESC
+  `).all();
+  res.json(tasks);
+});
+
+app.post('/api/warmup', auth, (req, res) => {
+  const { account_id, channels_to_read, daily_limit, active_hours_start, active_hours_end,
+          react_enabled, read_enabled, auto_increase } = req.body;
+  const existing = db.prepare('SELECT id FROM warmup_tasks WHERE account_id=?').get(account_id);
+  if (existing) return res.status(400).json({ error: 'Уже существует' });
+
+  const result = db.prepare(`
+    INSERT INTO warmup_tasks (account_id, channels_to_read, daily_limit, active_hours_start,
+      active_hours_end, react_enabled, read_enabled, auto_increase)
+    VALUES (?,?,?,?,?,?,?,?)
+  `).run(account_id, JSON.stringify(channels_to_read || []), daily_limit || 30,
+    active_hours_start || '09:00', active_hours_end || '22:00',
+    react_enabled ? 1 : 0, read_enabled ? 1 : 0, auto_increase ? 1 : 0);
+  res.json({ id: result.lastInsertRowid });
+});
+
+app.put('/api/warmup/:id/toggle', auth, (req, res) => {
+  const task = db.prepare('SELECT * FROM warmup_tasks WHERE id=?').get(req.params.id);
+  const newStatus = task.status === 'running' ? 'paused' : 'running';
+  db.prepare('UPDATE warmup_tasks SET status=? WHERE id=?').run(newStatus, req.params.id);
+  res.json({ status: newStatus });
+});
+
+app.delete('/api/warmup/:id', auth, (req, res) => {
+  db.prepare('DELETE FROM warmup_logs WHERE task_id=?').run(req.params.id);
+  db.prepare('DELETE FROM warmup_tasks WHERE id=?').run(req.params.id);
+  res.json({ ok: true });
+});
+
+// ── MASS REACT ────────────────────────────────────────
+app.get('/api/mass-react', auth, (req, res) => {
+  const campaigns = db.prepare('SELECT * FROM mass_react_campaigns ORDER BY created_at DESC').all();
+  res.json(campaigns);
+});
+
+app.post('/api/mass-react', auth, (req, res) => {
+  const c = req.body;
+  const result = db.prepare(`
+    INSERT INTO mass_react_campaigns (name, target_channels, accounts_pool, reactions,
+      posts_count, max_post_age_days, delay_min_seconds, delay_max_seconds, mode, schedule_cron)
+    VALUES (?,?,?,?,?,?,?,?,?,?)
+  `).run(c.name, JSON.stringify(c.target_channels), JSON.stringify(c.accounts_pool),
+    JSON.stringify(c.reactions || ['👍','❤️','🔥']),
+    c.posts_count || 10, c.max_post_age_days || 7,
+    c.delay_min_seconds || 3, c.delay_max_seconds || 15,
+    c.mode || 'manual', c.schedule_cron);
+  res.json({ id: result.lastInsertRowid });
+});
+
+app.post('/api/mass-react/:id/run', auth, async (req, res) => {
+  const campaign = db.prepare('SELECT * FROM mass_react_campaigns WHERE id=?').get(req.params.id);
+  if (!campaign) return res.status(404).json({ error: 'Not found' });
+  db.prepare("UPDATE mass_react_campaigns SET status='running', last_run=datetime('now') WHERE id=?").run(req.params.id);
+  res.json({ ok: true });
+  runMassReact(campaign, io).finally(() => {
+    db.prepare("UPDATE mass_react_campaigns SET status='idle' WHERE id=?").run(req.params.id);
+  });
+});
+
+app.delete('/api/mass-react/:id', auth, (req, res) => {
+  db.prepare('DELETE FROM mass_react_logs WHERE campaign_id=?').run(req.params.id);
+  db.prepare('DELETE FROM mass_react_campaigns WHERE id=?').run(req.params.id);
+  res.json({ ok: true });
+});
+
+// ── PIPELINES ─────────────────────────────────────────
+app.get('/api/pipelines', auth, (req, res) => {
+  res.json(db.prepare('SELECT * FROM pipelines ORDER BY created_at DESC').all());
+});
+
+app.post('/api/pipelines', auth, (req, res) => {
+  const { name, steps, trigger_type, trigger_cron } = req.body;
+  const result = db.prepare(`
+    INSERT INTO pipelines (name, steps, trigger_type, trigger_cron)
+    VALUES (?,?,?,?)
+  `).run(name, JSON.stringify(steps), trigger_type || 'manual', trigger_cron);
+  res.json({ id: result.lastInsertRowid });
+});
+
+app.post('/api/pipelines/:id/run', auth, (req, res) => {
+  const pipeline = db.prepare('SELECT * FROM pipelines WHERE id=?').get(req.params.id);
+  if (!pipeline) return res.status(404).json({ error: 'Not found' });
+  const run = db.prepare("INSERT INTO pipeline_runs (pipeline_id) VALUES (?)").run(pipeline.id);
+  res.json({ run_id: run.lastInsertRowid });
+});
+
+app.delete('/api/pipelines/:id', auth, (req, res) => {
+  db.prepare('DELETE FROM pipeline_runs WHERE pipeline_id=?').run(req.params.id);
+  db.prepare('DELETE FROM pipelines WHERE id=?').run(req.params.id);
+  res.json({ ok: true });
+});
+
+// ── STATISTICS ────────────────────────────────────────
+app.get('/api/stats', auth, (req, res) => {
+  const accounts = db.prepare('SELECT status, COUNT(*) as count FROM accounts GROUP BY status').all();
+  const totalComments = db.prepare('SELECT SUM(total_comments) as total FROM neuro_comment_campaigns').get();
+  const totalReacts = db.prepare('SELECT SUM(total_reactions) as total FROM mass_react_campaigns').get();
+  const totalDMs = db.prepare('SELECT SUM(total_sent) as total FROM neuro_chat_campaigns').get();
+  const channelStats = db.prepare('SELECT * FROM channel_stats ORDER BY date DESC LIMIT 30').all();
+  const recentLogs = db.prepare('SELECT * FROM system_logs ORDER BY created_at DESC LIMIT 50').all();
+
+  res.json({
+    accounts,
+    totalComments: totalComments?.total || 0,
+    totalReacts: totalReacts?.total || 0,
+    totalDMs: totalDMs?.total || 0,
+    channelStats,
+    recentLogs,
+  });
+});
+
+app.post('/api/stats/channel', auth, (req, res) => {
+  const { subscribers, views } = req.body;
+  const today = new Date().toISOString().split('T')[0];
+  db.prepare(`
+    INSERT INTO channel_stats (date, subscribers, views) VALUES (?, ?, ?)
+    ON CONFLICT(date) DO UPDATE SET subscribers=excluded.subscribers, views=excluded.views
+  `).run(today, subscribers, views);
+  res.json({ ok: true });
+});
+
+// ── AI AGENT ──────────────────────────────────────────
+app.get('/api/agent', auth, (req, res) => {
+  const analyses = db.prepare('SELECT * FROM agent_analyses ORDER BY created_at DESC LIMIT 10').all();
+  res.json(analyses);
+});
+
+app.post('/api/agent/run', auth, async (req, res) => {
+  const settings = db.prepare('SELECT key, value FROM system_settings').all();
+  const sMap = Object.fromEntries(settings.map(s => [s.key, s.value]));
+
+  if (!sMap.claude_api_key) return res.status(400).json({ error: 'Claude API key not set' });
+
+  res.json({ ok: true, message: 'Анализ запущен' });
+  runAIAgent(sMap, io);
+});
+
+// ── SETTINGS ──────────────────────────────────────────
+app.get('/api/settings', auth, (req, res) => {
+  const rows = db.prepare('SELECT key, value FROM system_settings').all();
+  const settings = Object.fromEntries(rows.map(r => [r.key, r.value]));
+  delete settings.password_hash;
+  res.json(settings);
+});
+
+app.put('/api/settings', auth, (req, res) => {
+  const allowed = ['channel_link','channel_name','telegram_notify_bot_token',
+                   'telegram_notify_chat_id','claude_api_key','agent_interval_hours',
+                   'agent_auto_apply','tg_api_id','tg_api_hash','timezone'];
+  const updates = Object.entries(req.body).filter(([k]) => allowed.includes(k));
+  const stmt = db.prepare('UPDATE system_settings SET value=? WHERE key=?');
+  updates.forEach(([k, v]) => stmt.run(v, k));
+  res.json({ ok: true });
+});
+
+// ── LOGS ──────────────────────────────────────────────
+app.get('/api/logs', auth, (req, res) => {
+  const { module, level, limit = 100 } = req.query;
+  let query = 'SELECT * FROM system_logs';
+  const params = [];
+  const conditions = [];
+  if (module) { conditions.push('module = ?'); params.push(module); }
+  if (level) { conditions.push('level = ?'); params.push(level); }
+  if (conditions.length) query += ' WHERE ' + conditions.join(' AND ');
+  query += ' ORDER BY created_at DESC LIMIT ?';
+  params.push(parseInt(limit));
+  res.json(db.prepare(query).all(...params));
+});
+
+// ── ASYNC WORKERS ─────────────────────────────────────
+async function runParsingTask(task, io) {
+  const sources = JSON.parse(task.sources);
+  const filters = JSON.parse(task.filters || '{}');
+  const account = db.prepare('SELECT * FROM accounts WHERE id = ?').get(task.account_id);
+
+  if (!account?.session_string) throw new Error('No active account');
+  if (account.status === 'frozen' && account.flood_wait_until && account.flood_wait_until > new Date().toISOString()) {
+    throw new Error(`Аккаунт заморожен до ${account.flood_wait_until}`);
+  }
+
+  const { TelegramClient } = await import('telegram');
+  const { StringSession } = await import('telegram/sessions/index.js');
+  const settings = db.prepare('SELECT key, value FROM system_settings').all();
+  const sMap = Object.fromEntries(settings.map(s => [s.key, s.value]));
+
+  const client = new TelegramClient(
+    new StringSession(account.session_string),
+    parseInt(sMap.tg_api_id || '2040'),
+    sMap.tg_api_hash || 'b18441a1ff607e10a989891a5462e627',
+    { connectionRetries: 3, proxy: buildProxy(account) }
+  );
+
+  await client.connect();
+  let total = 0;
+  const insertUser = db.prepare(`
+    INSERT OR IGNORE INTO parsed_users (task_id, user_id, username, first_name, last_name, is_premium, is_bot, lang_code, source_channel)
+    VALUES (?,?,?,?,?,?,?,?,?)
+  `);
+
+  for (const source of sources) {
+    try {
+      const entity = await client.getEntity(source);
+      const participants = await client.getParticipants(entity, { limit: filters.members_limit || 1000 });
+
+      for (const p of participants) {
+        if (filters.skip_bots && p.bot) continue;
+        if (filters.skip_deleted && p.deleted) continue;
+        if (filters.only_with_username && !p.username) continue;
+        if (filters.only_premium && !p.premium) continue;
+
+        insertUser.run(task.id, p.id?.toString(), p.username, p.firstName, p.lastName,
+          p.premium ? 1 : 0, p.bot ? 1 : 0, p.langCode, source);
+        total++;
+      }
+
+      io.emit('parsing:progress', { id: task.id, source, count: total });
+      await new Promise(r => setTimeout(r, 1000));
+    } catch (e) {
+      if (e.message?.includes('FROZEN_METHOD_INVALID') || e.message?.includes('FROZEN_METHOD')) {
+        freezeAccount(db, task.account_id);
+        logSystem('warn', 'parsing', `Account ${task.account_id} frozen 24h: ${e.message}`, db);
+        break;
+      }
+      logSystem('error', 'parsing', `Failed to parse ${source}: ${e.message}`, db);
+    }
+  }
+
+  await client.disconnect();
+  db.prepare(`UPDATE parsing_tasks SET status='completed', result_count=?, completed_at=datetime('now') WHERE id=?`)
+    .run(total, task.id);
+  io.emit('parsing:update', { id: task.id, status: 'completed', count: total });
+}
+
+async function runChannelSearchTask(task, io) {
+  const account = db.prepare('SELECT * FROM accounts WHERE id = ?').get(task.account_id);
+  if (!account?.session_string) throw new Error('No active account');
+  if (account.status === 'frozen' && account.flood_wait_until && account.flood_wait_until > new Date().toISOString()) {
+    throw new Error(`Аккаунт заморожен до ${account.flood_wait_until}`);
+  }
+
+  const { TelegramClient } = await import('telegram');
+  const { StringSession } = await import('telegram/sessions/index.js');
+  const { Api } = await import('telegram');
+  const settings = db.prepare('SELECT key, value FROM system_settings').all();
+  const sMap = Object.fromEntries(settings.map(s => [s.key, s.value]));
+
+  const client = new TelegramClient(
+    new StringSession(account.session_string),
+    parseInt(sMap.tg_api_id || '2040'),
+    sMap.tg_api_hash || 'b18441a1ff607e10a989891a5462e627',
+    { connectionRetries: 3, proxy: buildProxy(account) }
+  );
+
+  await client.connect();
+
+  const insertChannel = db.prepare(`
+    INSERT OR IGNORE INTO parsed_channels (search_id, channel_id, title, username, description, members_count)
+    VALUES (?,?,?,?,?,?)
+  `);
+
+  let total = 0;
+  const limit = Math.min(task.result_limit || 100, 200);
+  const minMembers = task.min_members || 0;
+
+  function processChat(chat) {
+    if (total >= limit) return;
+    if (!chat.username || !chat.title) return;
+    const memberCount = chat.participantsCount || 0;
+    if (memberCount < minMembers) return;
+    const ins = insertChannel.run(
+      task.id,
+      chat.id?.toString(),
+      chat.title || '',
+      chat.username || '',
+      chat.about || '',
+      memberCount
+    );
+    if (ins.changes > 0) {
+      total++;
+      io.emit('channels:progress', { id: task.id, count: total });
+    }
+  }
+
+  try {
+    // Разбиваем по запятой, ищем по каждому ключевому слову
+    const keywords = task.keyword.split(',').map(k => k.trim()).filter(Boolean);
+
+    for (const kw of keywords) {
+      if (total >= limit) break;
+
+      // Метод 1: messages.SearchGlobal — основной (contacts.Search заморожен у ряда API ID)
+      try {
+        const globalResult = await client.invoke(new Api.messages.SearchGlobal({
+          q: kw,
+          filter: new Api.InputMessagesFilterEmpty(),
+          minDate: 0,
+          maxDate: 0,
+          offsetRate: 0,
+          offsetPeer: new Api.InputPeerEmpty(),
+          offsetId: 0,
+          limit: 100,
+        }));
+        for (const chat of (globalResult.chats || [])) processChat(chat);
+      } catch (e) {
+        // если SearchGlobal тоже заморожен — пробуем contacts.Search
+        if (e.message?.includes('FROZEN')) {
+          try {
+            const result = await client.invoke(new Api.contacts.Search({ q: kw, limit: 100 }));
+            for (const chat of (result.chats || [])) processChat(chat);
+          } catch {}
+        }
+      }
+    }
+  } finally {
+    await client.disconnect();
+  }
+
+  db.prepare(`UPDATE channel_searches SET status='completed', result_count=?, completed_at=datetime('now') WHERE id=?`)
+    .run(total, task.id);
+  io.emit('channels:update', { id: task.id, status: 'completed', count: total });
+}
+
+async function runMassReact(campaign, io) {
+  const channels = JSON.parse(campaign.target_channels);
+  const accountIds = JSON.parse(campaign.accounts_pool);
+  const reactions = JSON.parse(campaign.reactions);
+
+  const settings = db.prepare('SELECT key, value FROM system_settings').all();
+  const sMap = Object.fromEntries(settings.map(s => [s.key, s.value]));
+
+  let totalDone = 0;
+
+  for (const accountId of accountIds) {
+    const account = db.prepare('SELECT * FROM accounts WHERE id=? AND status="active"').get(accountId);
+    if (!account?.session_string) continue;
+
+    try {
+      const { TelegramClient } = await import('telegram');
+      const { StringSession } = await import('telegram/sessions/index.js');
+
+      const client = new TelegramClient(
+        new StringSession(account.session_string),
+        parseInt(sMap.tg_api_id || '2040'),
+        sMap.tg_api_hash || 'b18441a1ff607e10a989891a5462e627',
+        { connectionRetries: 3, proxy: buildProxy(account) }
+      );
+
+      await client.connect();
+
+      for (const channel of channels) {
+        try {
+          const entity = await client.getEntity(channel);
+          const messages = await client.getMessages(entity, { limit: campaign.posts_count });
+
+          for (const msg of messages) {
+            const reaction = reactions[Math.floor(Math.random() * reactions.length)];
+            try {
+              await client.invoke(new (await import('telegram/tl/functions/messages/index.js')).SendReaction({
+                peer: entity,
+                msgId: msg.id,
+                reaction: [{ _: 'reactionEmoji', emoticon: reaction }],
+              }));
+
+              db.prepare(`INSERT INTO mass_react_logs (campaign_id, account_id, channel, message_id, reaction, status)
+                VALUES (?,?,?,?,?,'done')`).run(campaign.id, account.id, channel, msg.id, reaction);
+              totalDone++;
+              io.emit('massreact:progress', { campaign_id: campaign.id, total: totalDone });
+
+              const delay = campaign.delay_min_seconds * 1000 +
+                Math.random() * (campaign.delay_max_seconds - campaign.delay_min_seconds) * 1000;
+              await new Promise(r => setTimeout(r, delay));
+            } catch (e) {
+              db.prepare(`INSERT INTO mass_react_logs (campaign_id, account_id, channel, message_id, reaction, status)
+                VALUES (?,?,?,?,?,'error')`).run(campaign.id, account.id, channel, msg.id, reaction);
+            }
+          }
+        } catch (e) {
+          logSystem('error', 'mass-react', `Channel ${channel}: ${e.message}`, db);
+        }
+      }
+
+      await client.disconnect();
+    } catch (e) {
+      if (e.message?.includes('FROZEN_METHOD_INVALID') || e.message?.includes('FROZEN_METHOD')) {
+        freezeAccount(db, accountId);
+        logSystem('warn', 'mass-react', `Account ${accountId} frozen 24h: ${e.message}`, db);
+      } else {
+        logSystem('error', 'mass-react', `Account ${accountId}: ${e.message}`, db);
+      }
+    }
+  }
+
+  db.prepare('UPDATE mass_react_campaigns SET total_reactions=total_reactions+? WHERE id=?')
+    .run(totalDone, campaign.id);
+}
+
+async function runAIAgent(settings, io) {
+  try {
+    const Anthropic = (await import('@anthropic-ai/sdk')).default;
+    const client = new Anthropic({ apiKey: settings.claude_api_key });
+
+    const accounts = db.prepare('SELECT status, COUNT(*) as cnt FROM accounts GROUP BY status').all();
+    const recentComments = db.prepare('SELECT COUNT(*) as cnt FROM neuro_comment_logs WHERE created_at > datetime("now", "-24 hours")').get();
+    const recentDMs = db.prepare('SELECT COUNT(*) as cnt FROM neuro_chat_contacts WHERE sent_at > datetime("now", "-24 hours")').get();
+    const channelStats = db.prepare('SELECT * FROM channel_stats ORDER BY date DESC LIMIT 7').all();
+
+    const prompt = `Ты AI-агент системы Creonix (инструмент продвижения Telegram каналов).
+Проанализируй текущее состояние системы и дай рекомендации.
+
+Данные:
+- Аккаунты: ${JSON.stringify(accounts)}
+- Комментариев за 24ч: ${recentComments?.cnt || 0}
+- ДМ за 24ч: ${recentDMs?.cnt || 0}
+- Статистика канала (7 дней): ${JSON.stringify(channelStats)}
+- Канал: ${settings.channel_link || 'не указан'}
+
+Дай краткий анализ (2-3 предложения), выяви проблемы (список) и дай рекомендации (список из 3-5 пунктов).
+Ответь в JSON: { "summary": "...", "problems": ["..."], "recommendations": ["..."] }`;
+
+    const response = await client.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 1024,
+      messages: [{ role: 'user', content: prompt }],
+    });
+
+    const text = response.content[0].text;
+    let parsed;
+    try {
+      const jsonMatch = text.match(/\{[\s\S]*\}/);
+      parsed = jsonMatch ? JSON.parse(jsonMatch[0]) : { summary: text, problems: [], recommendations: [] };
+    } catch {
+      parsed = { summary: text, problems: [], recommendations: [] };
+    }
+
+    const result = db.prepare(`
+      INSERT INTO agent_analyses (summary, problems, recommendations)
+      VALUES (?,?,?)
+    `).run(parsed.summary, JSON.stringify(parsed.problems), JSON.stringify(parsed.recommendations));
+
+    io.emit('agent:complete', { id: result.lastInsertRowid, ...parsed });
+  } catch (e) {
+    logSystem('error', 'agent', e.message, db);
+    io.emit('agent:error', { error: e.message });
+  }
+}
+
+function logSystem(level, module, message, db, details = null) {
+  db.prepare('INSERT INTO system_logs (level, module, message, details) VALUES (?,?,?,?)')
+    .run(level, module, message, details);
+}
+
+// Neuro commenting worker (every 5 minutes)
+cron.schedule('*/5 * * * *', async () => {
+  console.log('[CRON] 🔔 Запуск крон задачи для neuro-comment', new Date().toISOString());
+  const campaigns = db.prepare("SELECT * FROM neuro_comment_campaigns WHERE status='running'").all();
+  console.log('[CRON] Найдено кампаний:', campaigns.length);
+  for (const campaign of campaigns) {
+    console.log('[CRON] Запуск кампании:', campaign.id, campaign.name);
+    try {
+      await runNeuroComment(campaign, io);
+    } catch (e) {
+      console.error('[CRON] ⛔ Ошибка в runNeuroComment:', e.message);
+      logSystem('error', 'neuro-comment', e.message, db);
+    }
+  }
+  console.log('[CRON] ✅ Крон задача завершена');
+});
+
+// Auto-unfreeze accounts after 24h freeze expires
+cron.schedule('0 * * * *', () => {
+  db.prepare("UPDATE accounts SET status='inactive', flood_wait_until=NULL WHERE status='frozen' AND flood_wait_until <= datetime('now')").run();
+});
+
+// AI Agent auto-run
+cron.schedule('0 */6 * * *', async () => {
+  const settings = db.prepare('SELECT key, value FROM system_settings').all();
+  const sMap = Object.fromEntries(settings.map(s => [s.key, s.value]));
+  if (sMap.agent_auto_apply === '1' && sMap.claude_api_key) {
+    await runAIAgent(sMap, io);
+  }
+});
+
+// Build GramJS proxy config from account object (returns undefined if no proxy set)
+function buildProxy(account) {
+  if (!account?.proxy_host) return undefined;
+  return {
+    ip: account.proxy_host,
+    port: parseInt(account.proxy_port) || 1080,
+    username: account.proxy_user || undefined,
+    password: account.proxy_pass || undefined,
+    socksType: account.proxy_type === 'socks4' ? 4 : 5,
+    timeout: 30,
+  };
+}
+
+// Freeze account for N hours (e.g. after FROZEN_METHOD_INVALID)
+function freezeAccount(db, accountId, hours = 24) {
+  db.prepare(`UPDATE accounts SET status='frozen', flood_wait_until=datetime('now','+${hours} hours') WHERE id=?`).run(accountId);
+}
+
+// Parse channel identifier — returns { type: 'username'|'invite', value: string }
+function parseChannel(ch) {
+  ch = (ch || '').trim().replace(/\/+$/, ''); // trim whitespace and trailing slashes
+  // tg://resolve?domain=USERNAME
+  const tgResolveMatch = ch.match(/tg:\/\/resolve\?domain=([a-zA-Z0-9_]{3,})/i);
+  if (tgResolveMatch) return { type: 'username', value: '@' + tgResolveMatch[1] };
+  // Private invite links: t.me/+HASH or t.me/joinchat/HASH
+  const inviteMatch = ch.match(/(?:https?:\/\/)?t\.me\/(?:\+|joinchat\/)([a-zA-Z0-9_-]+)/);
+  if (inviteMatch) return { type: 'invite', value: inviteMatch[1] };
+  // Public username links: t.me/username (http/https or plain t.me)
+  const pubMatch = ch.match(/(?:https?:\/\/)?t\.me\/([a-zA-Z0-9_]{3,})/);
+  if (pubMatch) return { type: 'username', value: '@' + pubMatch[1] };
+  // Already @username
+  if (ch.startsWith('@')) return { type: 'username', value: ch };
+  // Plain username
+  if (/^[a-zA-Z0-9_]{3,}$/.test(ch)) return { type: 'username', value: '@' + ch };
+  return null;
+}
+
+// Join a channel and return its entity + whether this is a NEW join (not already a member).
+// Returns: { entity, isNew: boolean }
+// isNew=true  — аккаунт только что вступил → нужна задержка перед комментарием
+// isNew=false — аккаунт уже был в канале → задержка не нужна, сразу комментируем
+async function joinAndGetEntity(client, Api, ch, onLeaveChannel) {
+  const parsed = parseChannel(ch);
+  if (!parsed) throw new Error(`Не удалось распознать формат канала: "${ch}" (поддерживается @username, t.me/name, t.me/+HASH)`);
+
+  if (parsed.type === 'invite') {
+    // Private invite link (t.me/+HASH)
+    try {
+      const result = await client.invoke(new Api.messages.ImportChatInvite({ hash: parsed.value }));
+      const chat = result.chats?.[0];
+      if (!chat) throw new Error('Telegram не вернул данные канала после вступления по инвайт-ссылке');
+      const entity = await client.getEntity(new Api.PeerChannel({ channelId: chat.id }));
+      return { entity, isNew: true };
+    } catch (e) {
+      if (e.message?.includes('CHANNELS_TOO_MUCH')) {
+        await leaveOldestChannel(client, Api, onLeaveChannel);
+        return await joinAndGetEntity(client, Api, ch, onLeaveChannel);
+      }
+      if (e.message?.includes('ALREADY') || e.message?.includes('already')) {
+        // Already a member — no delay needed
+        try {
+          const inv = await client.invoke(new Api.messages.CheckChatInvite({ hash: parsed.value }));
+          const chat = inv.chat ?? inv.chats?.[0];
+          if (chat) {
+            const entity = await client.getEntity(new Api.PeerChannel({ channelId: chat.id }));
+            return { entity, isNew: false };
+          }
+        } catch (_) {}
+        const entity = await client.getEntity('https://t.me/+' + parsed.value);
+        return { entity, isNew: false };
+      }
+      if (e.message?.includes('INVITE_HASH_EXPIRED'))
+        throw new Error(`Инвайт-ссылка истекла или была отозвана: ${ch}`);
+      if (e.message?.includes('INVITE_HASH_INVALID'))
+        throw new Error(`Неверная инвайт-ссылка: ${ch} — проверьте формат t.me/+HASH`);
+      if (e.message?.includes('PEER_FLOOD'))
+        throw new Error('PEER_FLOOD: аккаунт в спам-блоке, вступление в каналы временно ограничено');
+      if (e.message?.includes('USER_DEACTIVATED'))
+        throw new Error('Аккаунт деактивирован или заблокирован Telegram');
+      if (e.message?.includes('FLOOD_WAIT'))
+        throw e; // propagate to outer flood handler
+      throw new Error(`Ошибка вступления по инвайт-ссылке: ${e.message}`);
+    }
+  } else {
+    // Public @username channel
+    let entity;
+    try {
+      entity = await client.getEntity(parsed.value);
+    } catch (e) {
+      if (e.message?.includes('No user has') || e.message?.includes('Cannot find'))
+        throw new Error(`Канал ${ch} не найден (удалён, приватный или неверное имя)`);
+      throw new Error(`Не удалось получить данные канала ${ch}: ${e.message}`);
+    }
+    try {
+      await client.invoke(new Api.channels.JoinChannel({ channel: entity }));
+      return { entity, isNew: true };
+    } catch (e) {
+      if (e.message?.includes('CHANNELS_TOO_MUCH')) {
+        await leaveOldestChannel(client, Api, onLeaveChannel);
+        await client.invoke(new Api.channels.JoinChannel({ channel: entity }));
+        return { entity, isNew: true };
+      }
+      if (e.message?.includes('USER_ALREADY_PARTICIPANT') || e.message?.includes('already')) {
+        return { entity, isNew: false };
+      }
+      if (e.message?.includes('CHANNEL_PRIVATE'))
+        throw new Error(`Канал ${ch} приватный — используйте инвайт-ссылку (t.me/+HASH)`);
+      if (e.message?.includes('USER_BANNED_IN_CHANNEL'))
+        throw new Error(`Аккаунт заблокирован в канале ${ch}`);
+      if (e.message?.includes('PEER_FLOOD'))
+        throw new Error('PEER_FLOOD: аккаунт в спам-блоке, вступление в каналы временно ограничено');
+      if (e.message?.includes('CHAT_ADMIN_REQUIRED'))
+        throw new Error(`Для вступления в ${ch} требуются права администратора`);
+      if (e.message?.includes('FLOOD_WAIT'))
+        throw e; // propagate to outer flood handler
+      throw new Error(`Ошибка вступления в ${ch}: ${e.message}`);
+    }
+  }
+}
+
+async function leaveOldestChannel(client, Api, onLeaveChannel) {
+  const dialogs = await client.getDialogs({ limit: 500 });
+  const channels = dialogs.filter(d => d.isChannel && !d.entity?.creator);
+  if (!channels.length) throw new Error('CHANNELS_TOO_MUCH: нет каналов для выхода');
+  const oldest = channels.sort((a, b) => (a.date || 0) - (b.date || 0))[0];
+  const title = oldest.title || oldest.entity?.username || 'неизвестный';
+  await client.invoke(new Api.channels.LeaveChannel({ channel: oldest.inputEntity }));
+  if (onLeaveChannel) onLeaveChannel(title);
+}
+
+async function runNeuroComment(campaign, io) {
+  console.log('[runNeuroComment] 🚀 НАЧАЛО для кампании', campaign.id, campaign.name);
+  const settings = db.prepare('SELECT key, value FROM system_settings').all();
+  console.log('[runNeuroComment] Settings загружены');
+  const sMap = Object.fromEntries(settings.map(s => [s.key, s.value]));
+
+  // Active hours check using user timezone
+  const tz = sMap.timezone || 'UTC';
+  const now = new Date();
+  const hourInTz = parseInt(now.toLocaleString('en-US', { timeZone: tz, hour: 'numeric', hour12: false }));
+  const [startH] = campaign.active_hours_start.split(':').map(Number);
+  const [endH] = campaign.active_hours_end.split(':').map(Number);
+  console.log('[runNeuroComment] Проверка времени:', { hourInTz, startH, endH });
+  if (hourInTz < startH || hourInTz > endH) {
+    console.log('[runNeuroComment] ⏭️ Кампания не активна в это время');
+    return;
+  }
+
+  // Log: campaign start time
+  db.prepare(`INSERT INTO neuro_comment_logs (campaign_id, account_id, channel, status, error_text) VALUES (?,?,?,?,?)`)
+    .run(campaign.id, null, '', 'connect', '▶ Кампания запущена: ' + new Date().toLocaleString('ru-RU', { timeZone: tz, timeStyle: 'medium', dateStyle: 'short' }));
+
+  console.log('[runNeuroComment] Парсинг каналов и аккаунтов...');
+  const channels = JSON.parse(campaign.target_channels).filter(Boolean);
+  const accountIds = JSON.parse(campaign.accounts_pool);
+  console.log('[runNeuroComment] Каналы:', channels.length, 'Аккаунты:', accountIds.length);
+
+  // Import GramJS upfront — needed for subscription even without API key
+  console.log('[runNeuroComment] Импорт модулей...');
+  const { TelegramClient } = await import('telegram');
+  const { StringSession } = await import('telegram/sessions/index.js');
+  const { Api } = await import('telegram');
+  console.log('[runNeuroComment] ✅ Модули импортированы');
+
+  // Lazy-load Anthropic only when API key is present
+  let aiClient = null;
+  if (sMap.claude_api_key) {
+    console.log('[runNeuroComment] Инициализация Anthropic...');
+    const Anthropic = (await import('@anthropic-ai/sdk')).default;
+    aiClient = new Anthropic({ apiKey: sMap.claude_api_key });
+    console.log('[runNeuroComment] ✅ Anthropic инициализирован');
+  } else {
+    console.log('[runNeuroComment] ⚠️ Claude API key не установлен');
+  }
+
+  // Device fingerprints — rotate per account to appear as different devices
+  const deviceProfiles = [
+    { deviceModel: 'iPhone 14 Pro', systemVersion: 'iOS 17.0', appVersion: '10.5.0', langCode: 'ru' },
+    { deviceModel: 'Samsung Galaxy S23', systemVersion: 'Android 13', appVersion: '10.5.0', langCode: 'ru' },
+    { deviceModel: 'Pixel 7', systemVersion: 'Android 14', appVersion: '10.5.0', langCode: 'ru' },
+    { deviceModel: 'iPhone 13', systemVersion: 'iOS 16.7', appVersion: '10.4.0', langCode: 'ru' },
+  ];
+
+  for (const accountId of accountIds) {
+    // Skip accounts on flood-wait cooldown
+    const account = db.prepare(`SELECT * FROM accounts WHERE id=? AND status='active' AND (flood_wait_until IS NULL OR flood_wait_until < datetime('now'))`).get(accountId);
+    if (!account?.session_string) continue;
+
+    // Count only successful comments toward daily limits
+    const commentsToday = db.prepare(`
+      SELECT COUNT(*) as cnt FROM neuro_comment_logs
+      WHERE campaign_id=? AND account_id=? AND status='done' AND created_at > date('now')
+    `).get(campaign.id, accountId);
+    if (commentsToday.cnt >= campaign.max_per_account_per_day) continue;
+
+    const totalToday = db.prepare(`
+      SELECT COUNT(*) as cnt FROM neuro_comment_logs
+      WHERE campaign_id=? AND status='done' AND created_at > date('now')
+    `).get(campaign.id);
+    if (totalToday.cnt >= campaign.max_per_day) break;
+
+    const channelRaw = channels[Math.floor(Math.random() * channels.length)];
+    const deviceInfo = deviceProfiles[accountId % deviceProfiles.length];
+    let client = null;
+    try {
+      client = new TelegramClient(
+        new StringSession(account.session_string),
+        parseInt(sMap.tg_api_id || '2040'),
+        sMap.tg_api_hash || 'b18441a1ff607e10a989891a5462e627',
+        { connectionRetries: 3, proxy: buildProxy(account), floodSleepThreshold: 0, ...deviceInfo }
+      );
+
+      // Log: connecting
+      console.log('[runNeuroComment] Подключение к Telegram для', accountId);
+      db.prepare(`INSERT INTO neuro_comment_logs (campaign_id, account_id, channel, status, error_text) VALUES (?,?,?,?,?)`)
+        .run(campaign.id, accountId, channelRaw, 'connect', `Подключение к Telegram (${account.phone || account.first_name || 'acc#' + accountId})...`);
+
+      await client.connect();
+      console.log('[runNeuroComment] ✅ Подключение успешно для', accountId);
+
+      // Check if session is still authorized
+      console.log('[runNeuroComment] Проверка авторизации для', accountId);
+      let isAuth = false;
+      try {
+        // Use timeout to prevent hanging on network issues
+        const authPromise = client.isUserAuthorized();
+        const timeoutPromise = new Promise((_, reject) =>
+          setTimeout(() => reject(new Error('Auth check timeout (5s)')), 5000)
+        );
+        isAuth = await Promise.race([authPromise, timeoutPromise]);
+        console.log('[runNeuroComment] Статус авторизации:', accountId, isAuth);
+      } catch (authErr) {
+        console.error('[runNeuroComment] ⚠️ Ошибка при проверке авторизации:', authErr.message);
+        isAuth = false;
+      }
+
+      if (!isAuth) {
+        db.prepare(`INSERT INTO neuro_comment_logs (campaign_id, account_id, channel, status, error_text) VALUES (?,?,?,?,?)`)
+          .run(campaign.id, accountId, channelRaw, 'error', `Сессия аккаунта не авторизована (${account.phone || account.first_name || accountId})`);
+        await client.disconnect();
+        continue;
+      }
+
+      try {
+        // Step 1: Subscribe to target channel (always, regardless of API key)
+        db.prepare(`INSERT INTO neuro_comment_logs (campaign_id, account_id, channel, status, error_text) VALUES (?,?,?,?,?)`)
+          .run(campaign.id, accountId, channelRaw, 'connect', 'Вступление в канал...');
+
+        console.log('[runNeuroComment] Вступление в канал:', channelRaw);
+        let entity, isNew;
+        try {
+          // Use timeout to prevent hanging on channel join
+          const joinPromise = joinAndGetEntity(client, Api, channelRaw, (leftTitle) => {
+            console.log('[runNeuroComment] CHANNELS_TOO_MUCH: освобождаю место');
+            db.prepare(`INSERT INTO neuro_comment_logs (campaign_id, account_id, channel, status, error_text) VALUES (?,?,?,?,?)`)
+              .run(campaign.id, accountId, channelRaw, 'connect', `CHANNELS_TOO_MUCH: покинул канал "${leftTitle}" для освобождения места, повторяю...`);
+          });
+          const timeoutPromise = new Promise((_, reject) =>
+            setTimeout(() => reject(new Error('Channel join timeout (30s)')), 30000)
+          );
+          const result = await Promise.race([joinPromise, timeoutPromise]);
+          entity = result.entity;
+          isNew = result.isNew;
+          console.log('[runNeuroComment] ✅ Вступление успешно:', { channel: channelRaw, isNew });
+        } catch (joinErr) {
+          console.error('[runNeuroComment] ⚠️ Ошибка при вступлении в канал:', joinErr.message);
+          db.prepare(`INSERT INTO neuro_comment_logs (campaign_id, account_id, channel, status, error_text) VALUES (?,?,?,?,?)`)
+            .run(campaign.id, accountId, channelRaw, 'error', `Ошибка при вступлении: ${joinErr.message}`);
+          continue;
+        }
+
+        // Log join result
+        console.log('[runNeuroComment] ТОЧКА 1: isNew =', isNew, 'entity =', entity ? 'defined' : 'undefined');
+        console.log('[runNeuroComment] Логирование результата вступления, isNew:', isNew);
+        console.log('[runNeuroComment] ТОЧКА 2: начало логирования результата');
+        if (isNew) {
+          db.prepare(`INSERT INTO neuro_comment_logs (campaign_id, account_id, channel, status, error_text) VALUES (?,?,?,?,?)`)
+            .run(campaign.id, accountId, channelRaw, 'connect', `✅ Вступил в канал: ${channelRaw}`);
+        } else {
+          db.prepare(`INSERT INTO neuro_comment_logs (campaign_id, account_id, channel, status, error_text) VALUES (?,?,?,?,?)`)
+            .run(campaign.id, accountId, channelRaw, 'connect', `✔ Уже в канале: ${channelRaw} — задержка не нужна`);
+        }
+
+        // Join delay: ONLY for fresh joins (like gramgpt).
+        // If already a member — skip delay, comment immediately.
+        console.log('[runNeuroComment] ТОЧКА 3: проверка isNew перед задержкой, isNew =', isNew);
+        if (isNew) {
+          const joinDelayMin = campaign.join_delay_min ?? 2;
+          const joinDelayMax = campaign.join_delay_max ?? 4;
+          console.log('[runNeuroComment] ТОЧКА 3.5: joinDelayMin =', joinDelayMin, 'joinDelayMax =', joinDelayMax);
+          if (joinDelayMax > 0) {
+            const joinDelaySec = (joinDelayMin + Math.random() * (joinDelayMax - joinDelayMin)) * 60;
+            console.log('[runNeuroComment] ⏱ Ожидание после вступления:', Math.round(joinDelaySec), 'сек');
+            db.prepare(`INSERT INTO neuro_comment_logs (campaign_id, account_id, channel, status, error_text) VALUES (?,?,?,?,?)`)
+              .run(campaign.id, accountId, channelRaw, 'connect', `⏱ Новое вступление — задержка: ${Math.round(joinDelaySec)} сек...`);
+            await new Promise(r => setTimeout(r, joinDelaySec * 1000));
+            console.log('[runNeuroComment] ✅ Ожидание завершено');
+          }
+        }
+
+        // Step 2: If no API key, log the skip and move on — account is now subscribed
+        console.log('[runNeuroComment] ТОЧКА 4: проверка aiClient перед комментированием, aiClient =', aiClient ? 'defined' : 'undefined');
+        if (!aiClient) {
+          db.prepare(`INSERT INTO neuro_comment_logs (campaign_id, account_id, channel, status, error_text) VALUES (?,?,?,?,?)`)
+            .run(campaign.id, accountId, channelRaw, 'skip', 'Claude API key не задан — подписка выполнена, комментарий пропущен');
+          await client.disconnect();
+          continue;
+        }
+
+        // Step 3: Check if channel has a linked discussion group (required for comments)
+        const fullInfo = await client.invoke(new Api.channels.GetFullChannel({ channel: entity }));
+        const linkedChatId = fullInfo.fullChat.linkedChatId;
+        if (!linkedChatId) {
+          db.prepare(`INSERT INTO neuro_comment_logs (campaign_id, account_id, channel, status, error_text) VALUES (?,?,?,?,?)`)
+            .run(campaign.id, accountId, channelRaw, 'skip', 'Канал не поддерживает комментарии (нет связанной группы обсуждений)');
+          await client.disconnect();
+          continue;
+        }
+
+        console.log('[runNeuroComment] Получение сообщений из', channelRaw);
+        const messages = await client.getMessages(entity, { limit: 10 });
+        console.log('[runNeuroComment] Получено сообщений:', messages.length);
+        const recent = messages.filter(m => {
+          const ageH = (Date.now() / 1000 - m.date) / 3600;
+          return ageH <= campaign.max_post_age_hours && (m.text?.length || 0) >= campaign.min_post_length;
+        });
+
+        if (!recent.length) {
+          db.prepare(`INSERT INTO neuro_comment_logs (campaign_id, account_id, channel, status, error_text) VALUES (?,?,?,?,?)`)
+            .run(campaign.id, accountId, channelRaw, 'skip', 'Нет подходящих постов (слишком старые или короткие)');
+          await client.disconnect();
+          continue;
+        }
+
+        // comment_probability: skip commenting with (1 - probability) chance (like gramgpt)
+        const commentProb = campaign.comment_probability != null ? campaign.comment_probability : 1.0;
+        if (Math.random() > commentProb) {
+          db.prepare(`INSERT INTO neuro_comment_logs (campaign_id, account_id, channel, status, error_text) VALUES (?,?,?,?,?)`)
+            .run(campaign.id, accountId, channelRaw, 'skip', `Пропущено по вероятности (${Math.round(commentProb * 100)}%)`);
+          await client.disconnect();
+          continue;
+        }
+
+        const post = recent[Math.floor(Math.random() * recent.length)];
+
+        const aiModel = campaign.ai_model || 'claude-haiku-4-5-20251001';
+        console.log('[runNeuroComment] Генерация AI комментария...');
+        const aiResponse = await aiClient.messages.create({
+          model: aiModel,
+          max_tokens: 300,
+          messages: [{
+            role: 'user',
+            content: `Напиши ${campaign.tone === 'friendly' ? 'дружелюбный' : campaign.tone} комментарий к посту в стиле ${campaign.style}.
+${campaign.prompt_context ? 'Контекст: ' + campaign.prompt_context : ''}
+Пост: "${post.text.substring(0, 500)}"
+${campaign.use_emoji ? `Добавь ${campaign.emoji_count} эмодзи.` : 'Без эмодзи.'}
+${campaign.banned_words ? 'Не использовать: ' + campaign.banned_words : ''}
+Только комментарий, без пояснений.`
+          }]
+        });
+
+        const commentText = aiResponse.content[0].text.trim();
+
+        // commentTo sends to the linked discussion group (channel comments)
+        console.log('[runNeuroComment] Отправка комментария...');
+        await client.sendMessage(entity, { message: commentText, commentTo: post.id });
+        console.log('[runNeuroComment] ✅ КОММЕНТАРИЙ ОТПРАВЛЕН!');
+
+        db.prepare(`INSERT INTO neuro_comment_logs (campaign_id, account_id, channel, message_id, post_text, comment_text, status)
+          VALUES (?,?,?,?,?,?,'done')`).run(campaign.id, accountId, channelRaw, post.id, post.text.substring(0, 200), commentText);
+
+        db.prepare(`UPDATE neuro_comment_campaigns SET total_comments=total_comments+1, last_comment_at=datetime('now') WHERE id=?`)
+          .run(campaign.id);
+
+        io.emit('neuro-comment:done', { campaign_id: campaign.id, comment: commentText });
+      } catch (e) {
+        let errMsg = e.message || 'Неизвестная ошибка';
+
+        // --- Categorize known Telegram errors ---
+        if (e.message?.includes('FROZEN_METHOD_INVALID') || e.message?.includes('FROZEN')) {
+          freezeAccount(db, accountId);
+          errMsg = `🧊 Аккаунт заморожен Telegram (FROZEN) — автопауза 24ч`;
+          logSystem('warn', 'neuro-comment', `Account ${accountId} frozen 24h: ${e.message}`, db);
+        } else if (e.message?.includes('USER_DEACTIVATED_BAN') || e.message?.includes('USER_DEACTIVATED')) {
+          db.prepare(`UPDATE accounts SET status='banned' WHERE id=?`).run(accountId);
+          errMsg = `⛔ Аккаунт деактивирован или навсегда забанен Telegram`;
+        } else if (e.message?.includes('SESSION_REVOKED')) {
+          db.prepare(`UPDATE accounts SET status='inactive' WHERE id=?`).run(accountId);
+          errMsg = `🔑 Сессия аккаунта отозвана — требуется повторная авторизация`;
+        } else if (e.message?.includes('AUTH_KEY_UNREGISTERED') || e.message?.includes('AUTH_KEY_INVALID')) {
+          db.prepare(`UPDATE accounts SET status='inactive' WHERE id=?`).run(accountId);
+          errMsg = `🔑 Ключ авторизации недействителен — переавторизуйте аккаунт`;
+        } else if (e.message?.includes('CHAT_WRITE_FORBIDDEN')) {
+          errMsg = `🚫 Запись в канал запрещена — аккаунт забанен или ограничен в этом канале`;
+        } else if (e.message?.includes('SLOWMODE_WAIT')) {
+          const sec = e.message.match(/SLOWMODE_WAIT_?(\d+)/i)?.[1];
+          errMsg = `🐌 SlowMode в канале ${channelRaw}: ожидание ${sec || '?'} сек между сообщениями`;
+        } else if (e.message?.includes('PEER_FLOOD')) {
+          db.prepare(`UPDATE accounts SET flood_wait_until=datetime('now','+1 hour') WHERE id=?`).run(accountId);
+          errMsg = `⚠️ PEER_FLOOD: аккаунт в спам-блоке — автопауза 1ч`;
+        } else if (e.message?.includes('USER_BANNED_IN_CHANNEL')) {
+          errMsg = `🚫 Аккаунт заблокирован в канале ${channelRaw}`;
+        } else if (e.message?.includes('CHANNEL_PRIVATE')) {
+          errMsg = `🔒 Канал ${channelRaw} приватный — используйте инвайт-ссылку`;
+        } else if (e.message?.includes('INVITE_HASH_EXPIRED')) {
+          errMsg = `⏰ Инвайт-ссылка истекла: ${channelRaw} — обновите ссылку в настройках кампании`;
+        } else if (e.message?.includes('не найден') || e.message?.includes('Cannot find') || e.message?.includes('No user has')) {
+          errMsg = `❓ Канал ${channelRaw} не найден — возможно удалён или переименован`;
+        }
+
+        // Handle FLOOD_WAIT (extract seconds)
+        const floodSeconds = e.seconds || (() => {
+          const m = e.message?.match(/FLOOD_WAIT[_\s]+(\d+)/i);
+          return m ? parseInt(m[1]) : null;
+        })();
+        if (floodSeconds) {
+          const waitMin = Math.round(floodSeconds / 60);
+          db.prepare(`UPDATE accounts SET flood_wait_until=datetime('now','+${floodSeconds} seconds') WHERE id=?`).run(accountId);
+          errMsg = `⏳ FLOOD_WAIT ${floodSeconds} сек (~${waitMin} мин) — аккаунт автоматически на паузе до снятия ограничения`;
+        }
+
+        db.prepare(`INSERT INTO neuro_comment_logs (campaign_id, account_id, channel, status, error_text) VALUES (?,?,?,?,?)`)
+          .run(campaign.id, accountId, channelRaw, 'error', errMsg);
+        await client?.disconnect().catch(() => {});
+      }
+
+    } catch (e) {
+      // Connection-level error (bad session, flood, proxy, etc.)
+      logSystem('error', 'neuro-comment', `Account ${accountId}: ${e.message}`, db);
+      let connErr = e.message || 'Неизвестная ошибка подключения';
+
+      const outerFloodSec = e.seconds || (() => {
+        const m = e.message?.match(/FLOOD_WAIT[_\s]+(\d+)/i);
+        return m ? parseInt(m[1]) : null;
+      })();
+
+      if (outerFloodSec) {
+        db.prepare(`UPDATE accounts SET flood_wait_until=datetime('now','+${outerFloodSec} seconds') WHERE id=?`).run(accountId);
+        connErr = `⏳ FLOOD_WAIT при подключении: ${outerFloodSec} сек (~${Math.round(outerFloodSec/60)} мин) — аккаунт на паузе`;
+      } else if (e.message?.includes('FROZEN')) {
+        freezeAccount(db, accountId);
+        connErr = `🧊 Аккаунт заморожен при подключении — автопауза 24ч`;
+      } else if (e.message?.includes('SESSION_REVOKED') || e.message?.includes('AUTH_KEY')) {
+        db.prepare(`UPDATE accounts SET status='inactive' WHERE id=?`).run(accountId);
+        connErr = `🔑 Сессия недействительна — требуется повторная авторизация`;
+      } else if (e.message?.includes('USER_DEACTIVATED')) {
+        db.prepare(`UPDATE accounts SET status='banned' WHERE id=?`).run(accountId);
+        connErr = `⛔ Аккаунт деактивирован Telegram`;
+      } else if (e.message?.includes('proxy') || e.message?.includes('ECONNREFUSED') || e.message?.includes('ETIMEDOUT')) {
+        connErr = `🌐 Ошибка прокси (${account.proxy_host}:${account.proxy_port}): ${e.message}`;
+      } else {
+        connErr = `❌ Ошибка подключения аккаунта #${accountId}: ${e.message}`;
+      }
+
+      db.prepare(`INSERT INTO neuro_comment_logs (campaign_id, account_id, channel, status, error_text) VALUES (?,?,?,?,?)`)
+        .run(campaign.id, accountId, channelRaw || '', 'error', connErr);
+      if (client) { try { await client.disconnect(); } catch (_) {} }
+    }
+
+    await new Promise(r => setTimeout(r,
+      (campaign.delay_min_minutes + Math.random() * (campaign.delay_max_minutes - campaign.delay_min_minutes)) * 60000
+    ));
+  }
+}
+
+// WebSocket
+io.on('connection', socket => {
+  console.log('Client connected:', socket.id);
+});
+
+// Serve frontend for all non-API routes
+app.get('*', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+httpServer.listen(PORT, () => {
+  console.log(`Creonix running on port ${PORT}`);
+});
